@@ -9,6 +9,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID = os.environ["NOTION_DB_ID"]
 NOTION_VISITS_DB_ID = os.environ["NOTION_VISITS_DB_ID"]
+SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -33,6 +34,80 @@ def query_all(db_id, body={}):
         payload["start_cursor"] = res["next_cursor"]
     return results
 
+def get_csi_nps_data():
+    """Читает данные CSI+NPS из публичного Google Sheets"""
+    url = f"https://docs.google.com/spreadsheets/d/{SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1"
+    res = requests.get(url)
+    if res.status_code != 200:
+        return None
+
+    lines = res.text.strip().split("\n")
+    if len(lines) < 2:
+        return None
+
+    rows = []
+    for line in lines[1:]:  # пропускаем заголовок
+        cols = line.replace('"', '').split(",")
+        if len(cols) >= 7:
+            rows.append(cols)
+
+    if not rows:
+        return None
+
+    this_month = date.today().strftime("%m.%Y")  # формат 06.2026
+    month_rows = [r for r in rows if r[0].endswith(this_month[:2] + "." + this_month[3:])]
+    use_rows = month_rows if month_rows else rows
+
+    total = len(use_rows)
+    if total == 0:
+        return None
+
+    def avg(col_idx):
+        vals = []
+        for r in use_rows:
+            try:
+                vals.append(float(r[col_idx].strip().replace(",", ".")))
+            except:
+                pass
+        return round(sum(vals) / len(vals), 1) if vals else 0
+
+    # NPS из колонки 6 (индекс 6)
+    promoters = neutrals = critics = 0
+    for r in use_rows:
+        try:
+            score = float(r[6].strip().replace(",", "."))
+            if score >= 9:
+                promoters += 1
+            elif score >= 7:
+                neutrals += 1
+            else:
+                critics += 1
+        except:
+            pass
+
+    nps = round(((promoters - critics) / total) * 100) if total > 0 else 0
+
+    # Отзывы (колонка 7)
+    comments = []
+    for r in use_rows:
+        if len(r) > 7 and r[7].strip():
+            comments.append(r[7].strip())
+
+    return {
+        "total": total,
+        "mood": avg(1),
+        "hookah": avg(2),
+        "drinks": avg(3),
+        "food": avg(4),
+        "team": avg(5),
+        "nps": nps,
+        "promoters": promoters,
+        "neutrals": neutrals,
+        "critics": critics,
+        "comments": comments[-3:],  # последние 3 отзыва
+        "period": "этот месяц" if month_rows else "всё время"
+    }
+
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
@@ -54,7 +129,6 @@ async def get_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(results) == 1:
         await show_guest(update, context, results[0])
         return ConversationHandler.END
-
     elif len(results) > 1:
         context.user_data["search_results"] = [
             {"id": g["id"], "name": g["properties"]["Имя Гостя"]["title"][0]["plain_text"]}
@@ -67,7 +141,6 @@ async def get_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         )
         return SELECT_GUEST
-
     else:
         await update.message.reply_text(f"❌ Гость «{name}» не найден. Проверьте имя.")
         return ConversationHandler.END
@@ -82,8 +155,7 @@ async def select_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for g in context.user_data.get("search_results", []):
         if g["name"] == text:
             res = requests.get(f"https://api.notion.com/v1/pages/{g['id']}", headers=HEADERS)
-            guest = res.json()
-            await show_guest(update, context, guest)
+            await show_guest(update, context, res.json())
             return ConversationHandler.END
 
     await update.message.reply_text("Не понял выбор. Попробуй ещё раз.")
@@ -143,7 +215,7 @@ async def show_guest(update, context, guest):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Собираю статистику, подожди секунду...")
+    await update.message.reply_text("📊 Собираю статистику...")
 
     all_visits = query_all(NOTION_VISITS_DB_ID)
     all_guests = query_all(NOTION_DB_ID)
@@ -167,38 +239,30 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         hookah_items = vp.get("Кальян", {}).get("rich_text", [])
         if hookah_items:
-            hookah = hookah_items[0]["plain_text"].strip()
-            if hookah and hookah != "—":
-                hookah_counter[hookah] += 1
+            h = hookah_items[0]["plain_text"].strip()
+            if h and h != "—":
+                hookah_counter[h] += 1
 
         drinks_items = vp.get("Напитки", {}).get("rich_text", [])
         if drinks_items:
-            drink = drinks_items[0]["plain_text"].strip()
-            if drink and drink != "—":
-                drinks_counter[drink] += 1
+            dr = drinks_items[0]["plain_text"].strip()
+            if dr and dr != "—":
+                drinks_counter[dr] += 1
 
     guest_names = {}
     for g in all_guests:
-        gp = g["properties"]
-        title = gp.get("Имя Гостя", {}).get("title", [])
+        title = g["properties"].get("Имя Гостя", {}).get("title", [])
         if title:
             guest_names[g["id"]] = title[0]["plain_text"]
 
-    new_guests_month = sum(
-        1 for g in all_guests if g.get("created_time", "").startswith(this_month)
-    )
+    new_guests_month = sum(1 for g in all_guests if g.get("created_time", "").startswith(this_month))
 
-    top_guests = guest_visit_count.most_common(5)
     top_guests_text = ""
-    for i, (gid, count) in enumerate(top_guests, 1):
-        gname = guest_names.get(gid, "Неизвестный")
-        top_guests_text += f"  {i}. {gname} — {count} визитов\n"
+    for i, (gid, count) in enumerate(guest_visit_count.most_common(5), 1):
+        top_guests_text += f"  {i}. {guest_names.get(gid, '?')} — {count} визитов\n"
 
-    top_hookah = hookah_counter.most_common(3)
-    top_hookah_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(top_hookah, 1))
-
-    top_drinks = drinks_counter.most_common(3)
-    top_drinks_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(top_drinks, 1))
+    top_hookah_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(hookah_counter.most_common(3), 1))
+    top_drinks_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(drinks_counter.most_common(3), 1))
 
     text = (
         f"📊 *Статистика заведения*\n"
@@ -210,6 +274,32 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🪄 *Популярный кальян:*\n{top_hookah_text or '  Нет данных'}\n"
         f"🍹 *Популярные напитки:*\n{top_drinks_text or '  Нет данных'}"
     )
+
+    # CSI / NPS из Google Sheets
+    csi = get_csi_nps_data()
+    if csi:
+        def bar(score):
+            filled = int(score / 2)
+            return "🟩" * filled + "⬜" * (5 - filled)
+
+        text += f"\n\n━━━━━━━━━━━━━━\n"
+        text += f"⭐ *CSI / NPS — {csi['period']}* ({csi['total']} отзывов)\n\n"
+        text += f"😊 Вечер в целом: *{csi['mood']}/10* {bar(csi['mood'])}\n"
+        text += f"🪄 Кальян: *{csi['hookah']}/10* {bar(csi['hookah'])}\n"
+        text += f"🍹 Напитки: *{csi['drinks']}/10* {bar(csi['drinks'])}\n"
+        text += f"🍽 Еда: *{csi['food']}/10* {bar(csi['food'])}\n"
+        text += f"👨‍💼 Команда: *{csi['team']}/10* {bar(csi['team'])}\n\n"
+        text += f"🎯 *NPS: {csi['nps']}*\n"
+        text += f"  👍 Промоутеры: {csi['promoters']}\n"
+        text += f"  😐 Нейтралы: {csi['neutrals']}\n"
+        text += f"  👎 Критики: {csi['critics']}\n"
+
+        if csi['comments']:
+            text += f"\n💬 *Последние отзывы:*\n"
+            for c in csi['comments']:
+                text += f"  • {c}\n"
+    else:
+        text += "\n\n⭐ *CSI/NPS:* нет данных"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
