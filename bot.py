@@ -9,7 +9,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID = os.environ["NOTION_DB_ID"]
 NOTION_VISITS_DB_ID = os.environ["NOTION_VISITS_DB_ID"]
-SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
+CSI_SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -17,17 +17,13 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-GUEST_NAME, SELECT_GUEST = range(2)
+GUEST_NAME, SELECT_GUEST, AFTER_CARD, EDIT_CHOICE, EDIT_VALUE = range(5)
 
 def query_all(db_id, body={}):
     results = []
     payload = {**body, "page_size": 100}
     while True:
-        res = requests.post(
-            f"https://api.notion.com/v1/databases/{db_id}/query",
-            headers=HEADERS,
-            json=payload
-        ).json()
+        res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS, json=payload).json()
         results.extend(res.get("results", []))
         if not res.get("has_more"):
             break
@@ -35,29 +31,23 @@ def query_all(db_id, body={}):
     return results
 
 def get_csi_nps_data():
-    """Читает данные CSI+NPS из публичного Google Sheets"""
-    url = f"https://docs.google.com/spreadsheets/d/{SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1"
+    url = f"https://docs.google.com/spreadsheets/d/{CSI_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1"
     res = requests.get(url)
     if res.status_code != 200:
         return None
-
     lines = res.text.strip().split("\n")
     if len(lines) < 2:
         return None
-
     rows = []
-    for line in lines[1:]:  # пропускаем заголовок
+    for line in lines[1:]:
         cols = line.replace('"', '').split(",")
         if len(cols) >= 7:
             rows.append(cols)
-
     if not rows:
         return None
-
-    this_month = date.today().strftime("%m.%Y")  # формат 06.2026
+    this_month = date.today().strftime("%m.%Y")
     month_rows = [r for r in rows if r[0].endswith(this_month[:2] + "." + this_month[3:])]
     use_rows = month_rows if month_rows else rows
-
     total = len(use_rows)
     if total == 0:
         return None
@@ -71,54 +61,35 @@ def get_csi_nps_data():
                 pass
         return round(sum(vals) / len(vals), 1) if vals else 0
 
-    # NPS из колонки 6 (индекс 6)
     promoters = neutrals = critics = 0
     for r in use_rows:
         try:
             score = float(r[6].strip().replace(",", "."))
-            if score >= 9:
-                promoters += 1
-            elif score >= 7:
-                neutrals += 1
-            else:
-                critics += 1
+            if score >= 9: promoters += 1
+            elif score >= 7: neutrals += 1
+            else: critics += 1
         except:
             pass
-
     nps = round(((promoters - critics) / total) * 100) if total > 0 else 0
 
-    # Отзывы (колонка 7)
     comments = []
     for r in use_rows:
         if len(r) > 7 and r[7].strip():
             comments.append(r[7].strip())
 
     return {
-        "total": total,
-        "mood": avg(1),
-        "hookah": avg(2),
-        "drinks": avg(3),
-        "food": avg(4),
-        "team": avg(5),
-        "nps": nps,
-        "promoters": promoters,
-        "neutrals": neutrals,
-        "critics": critics,
-        "comments": comments[-3:],  # последние 3 отзыва
-        "period": "этот месяц" if month_rows else "всё время"
+        "total": total, "mood": avg(1), "hookah": avg(2), "drinks": avg(3), "food": avg(4), "team": avg(5),
+        "nps": nps, "promoters": promoters, "neutrals": neutrals, "critics": critics,
+        "comments": comments[-3:], "period": "этот месяц" if month_rows else "всё время"
     }
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text(
-        "🛑 Остановлено. Напиши имя гостя чтобы начать заново.",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    await update.message.reply_text("🛑 Остановлено. Напиши имя гостя чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 async def get_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
-
     res = requests.post(
         f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
         headers=HEADERS,
@@ -127,8 +98,7 @@ async def get_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = res.json().get("results", [])
 
     if len(results) == 1:
-        await show_guest(update, context, results[0])
-        return ConversationHandler.END
+        return await show_guest(update, context, results[0])
     elif len(results) > 1:
         context.user_data["search_results"] = [
             {"id": g["id"], "name": g["properties"]["Имя Гостя"]["title"][0]["plain_text"]}
@@ -143,27 +113,24 @@ async def get_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SELECT_GUEST
     else:
         await update.message.reply_text(f"❌ Гость «{name}» не найден. Проверьте имя.")
-        return ConversationHandler.END
+        return GUEST_NAME
 
 async def select_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-
     if text == "❌ Никто из них":
         await update.message.reply_text("Напиши имя гостя:", reply_markup=ReplyKeyboardRemove())
         return GUEST_NAME
-
     for g in context.user_data.get("search_results", []):
         if g["name"] == text:
             res = requests.get(f"https://api.notion.com/v1/pages/{g['id']}", headers=HEADERS)
-            await show_guest(update, context, res.json())
-            return ConversationHandler.END
-
+            return await show_guest(update, context, res.json())
     await update.message.reply_text("Не понял выбор. Попробуй ещё раз.")
     return SELECT_GUEST
 
 async def show_guest(update, context, guest):
     props = guest["properties"]
     guest_page_id = guest["id"]
+    context.user_data["current_guest_id"] = guest_page_id
 
     def get_text(prop):
         items = props.get(prop, {}).get("rich_text", [])
@@ -174,12 +141,28 @@ async def show_guest(update, context, guest):
     def get_select(prop):
         s = props.get(prop, {}).get("select")
         return s["name"] if s else "не указано"
+    def get_date(prop):
+        d = props.get(prop, {}).get("date")
+        return d["start"] if d else "не указана"
+    def get_phone(prop):
+        return props.get(prop, {}).get("phone_number") or "не указан"
+
+    birthday = get_date("Дата рождения")
+    birthday_alert = ""
+    if birthday != "не указана":
+        try:
+            bd_month_day = birthday[5:]
+            today_month_day = date.today().strftime("%m-%d")
+            if bd_month_day == today_month_day:
+                birthday_alert = "\n\n🎂🎉 *СЕГОДНЯ ДЕНЬ РОЖДЕНИЯ ГОСТЯ!* 🎉🎂"
+        except:
+            pass
 
     text = (
         f"👤 *{get_title('Имя Гостя')}*\n"
-        f"📊 Частота: {get_select('Частота визитов')}\n"
-        f"🪄 Кальян: {get_text('Кальян — вкус и крепость')}\n"
-        f"🍹 Напитки: {get_text('Напитки — предпочтения')}\n"
+        f"🏷 Статус: {get_select('Частота визитов')}\n"
+        f"🎂 День рождения: {birthday}\n"
+        f"📱 Телефон: {get_phone('Телефон')}\n"
         f"⭐ Важно: {get_text('Что важно для гостя')}\n"
     )
 
@@ -212,7 +195,101 @@ async def show_guest(update, context, guest):
     else:
         text += "\n📋 Визитов пока нет."
 
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    text += birthday_alert
+
+    keyboard = [["✏️ Редактировать карточку"], ["🔍 Новый поиск"]]
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return AFTER_CARD
+
+# ─── ПОСЛЕ ПОКАЗА КАРТОЧКИ ────────────────────────────
+
+async def after_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "✏️ Редактировать карточку":
+        keyboard = [
+            ["🏷 Статус", "🎂 День рождения"],
+            ["📱 Телефон", "⭐ Что важно"],
+            ["❌ Отмена"]
+        ]
+        await update.message.reply_text("Что редактируем?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return EDIT_CHOICE
+    elif text == "🔍 Новый поиск":
+        await update.message.reply_text("Напиши имя гостя:", reply_markup=ReplyKeyboardRemove())
+        return GUEST_NAME
+    else:
+        # Считаем что это новое имя для поиска
+        return await get_guest_name(update, context)
+
+# ─── РЕДАКТИРОВАНИЕ ───────────────────────────────────
+
+async def edit_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено. Напиши имя гостя для нового поиска.", reply_markup=ReplyKeyboardRemove())
+        return GUEST_NAME
+
+    field_map = {
+        "🏷 Статус": "status",
+        "🎂 День рождения": "birthday",
+        "📱 Телефон": "phone",
+        "⭐ Что важно": "important"
+    }
+
+    if text not in field_map:
+        await update.message.reply_text("Не понял выбор.")
+        return EDIT_CHOICE
+
+    context.user_data["edit_field"] = field_map[text]
+
+    if field_map[text] == "status":
+        keyboard = [["VIP", "Постоянный"], ["Редкий", "Новый"]]
+        await update.message.reply_text("Новый статус?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    elif field_map[text] == "birthday":
+        await update.message.reply_text("Новая дата рождения?\n(Например: 15.06.1990)", reply_markup=ReplyKeyboardRemove())
+    elif field_map[text] == "phone":
+        await update.message.reply_text("Новый номер телефона?", reply_markup=ReplyKeyboardRemove())
+    elif field_map[text] == "important":
+        await update.message.reply_text("Что важно для гостя?", reply_markup=ReplyKeyboardRemove())
+
+    return EDIT_VALUE
+
+async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    field = context.user_data["edit_field"]
+    guest_id = context.user_data["current_guest_id"]
+
+    properties = {}
+
+    if field == "status":
+        properties["Частота визитов"] = {"select": {"name": text}}
+    elif field == "birthday":
+        try:
+            parts = text.split(".")
+            if len(parts) == 3:
+                iso_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+                properties["Дата рождения"] = {"date": {"start": iso_date}}
+            else:
+                await update.message.reply_text("❌ Неверный формат. Используй: 15.06.1990")
+                return EDIT_VALUE
+        except:
+            await update.message.reply_text("❌ Неверный формат. Используй: 15.06.1990")
+            return EDIT_VALUE
+    elif field == "phone":
+        properties["Телефон"] = {"phone_number": text}
+    elif field == "important":
+        properties["Что важно для гостя"] = {"rich_text": [{"text": {"content": text}}]}
+
+    res = requests.patch(f"https://api.notion.com/v1/pages/{guest_id}", headers=HEADERS, json={"properties": properties})
+
+    if res.status_code == 200:
+        await update.message.reply_text("✅ Обновлено! Напиши имя гостя для нового поиска.", reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text("❌ Ошибка при обновлении.", reply_markup=ReplyKeyboardRemove())
+
+    context.user_data.clear()
+    return GUEST_NAME
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📊 Собираю статистику...")
@@ -232,17 +309,14 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         visit_date = d["start"] if d else ""
         if visit_date.startswith(this_month):
             month_visits.append(v)
-
         relations = vp.get("Гость", {}).get("relation", [])
         if relations:
             guest_visit_count[relations[0]["id"]] += 1
-
         hookah_items = vp.get("Кальян", {}).get("rich_text", [])
         if hookah_items:
             h = hookah_items[0]["plain_text"].strip()
             if h and h != "—":
                 hookah_counter[h] += 1
-
         drinks_items = vp.get("Напитки", {}).get("rich_text", [])
         if drinks_items:
             dr = drinks_items[0]["plain_text"].strip()
@@ -275,7 +349,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🍹 *Популярные напитки:*\n{top_drinks_text or '  Нет данных'}"
     )
 
-    # CSI / NPS из Google Sheets
     csi = get_csi_nps_data()
     if csi:
         def bar(score):
@@ -293,7 +366,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"  👍 Промоутеры: {csi['promoters']}\n"
         text += f"  😐 Нейтралы: {csi['neutrals']}\n"
         text += f"  👎 Критики: {csi['critics']}\n"
-
         if csi['comments']:
             text += f"\n💬 *Последние отзывы:*\n"
             for c in csi['comments']:
@@ -308,6 +380,9 @@ conv_handler = ConversationHandler(
     states={
         GUEST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_guest_name)],
         SELECT_GUEST: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_guest)],
+        AFTER_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, after_card)],
+        EDIT_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_choice)],
+        EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
     },
     fallbacks=[
         CommandHandler("stop", stop),
