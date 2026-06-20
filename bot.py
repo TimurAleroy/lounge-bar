@@ -1,341 +1,404 @@
 import os
-import asyncio
 import requests
+from collections import Counter
 from datetime import date
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes, ConversationHandler
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_PROBLEMS_DB_ID = "88be90a6768e4c9da2819565e1a69f62"
-NOTION_GUESTS_DB_ID = "35173a7166368022bf60d76141cca681"
-ADMIN_CHAT_ID = 188483198
-ENPS_SHEETS_ID = "1nKMCWGXsdQ-3KgMeFtPkIlmKlim4Ae6YFT-jEnZnLwY"
+NOTION_DB_ID = os.environ["NOTION_DB_ID"]
+NOTION_VISITS_DB_ID = os.environ["NOTION_VISITS_DB_ID"]
 CSI_SHEETS_ID = "1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc"
 
-NOTION_HEADERS = {
+HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json"
 }
 
-bot_app = None
+GUEST_NAME, SELECT_GUEST, AFTER_CARD, EDIT_CHOICE, EDIT_VALUE = range(5)
 
-def get_processed_from_notion():
-    """Читает уже обработанные отзывы из Notion по полю Дата отзыва + Комментарий"""
-    res = requests.post(
-        f"https://api.notion.com/v1/databases/{NOTION_PROBLEMS_DB_ID}/query",
-        headers=NOTION_HEADERS,
-        json={"page_size": 100}
-    )
-    results = res.json().get("results", [])
-    processed = set()
-    for p in results:
-        props = p["properties"]
-        comment = props.get("Комментарий гостя", {}).get("rich_text", [])
-        date_val = props.get("Дата отзыва", {}).get("date")
-        if comment and date_val:
-            key = f"{date_val['start']}_{comment[0]['plain_text']}"
-            processed.add(key)
-    return processed
+def query_all(db_id, body={}):
+    results = []
+    payload = {**body, "page_size": 100}
+    while True:
+        res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS, json=payload).json()
+        results.extend(res.get("results", []))
+        if not res.get("has_more"):
+            break
+        payload["start_cursor"] = res["next_cursor"]
+    return results
 
-def get_csi_rows():
+def get_csi_nps_data():
     url = f"https://docs.google.com/spreadsheets/d/{CSI_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1"
-    res = requests.get(url)
-    if res.status_code != 200:
-        return []
-    lines = res.text.strip().split("\n")
-    rows = []
-    for line in lines[1:]:
-        cols = [c.strip().strip('"') for c in line.split(",")]
-        if len(cols) >= 7 and cols[0]:
-            rows.append(cols)
-    return rows
-
-def find_worst_score(cols):
-    categories = [(1, "Общее"), (2, "Кальян"), (3, "Напитки"), (4, "Еда"), (5, "Команда")]
-    worst_score, worst_cat = 10, "Общее"
-    for idx, cat in categories:
-        try:
-            score = float(cols[idx].replace(",", "."))
-            if score < worst_score:
-                worst_score, worst_cat = score, cat
-        except:
-            pass
-    return worst_score, worst_cat
-
-def create_notion_problem(cols, worst_score, worst_cat, comment, visit_date):
-    page_data = {
-        "parent": {"database_id": NOTION_PROBLEMS_DB_ID},
-        "properties": {
-            "Проблема": {"title": [{"text": {"content": f"Низкая оценка — {worst_cat} ({worst_score}/10)"}}]},
-            "Категория": {"select": {"name": worst_cat}},
-            "Оценка гостя": {"number": worst_score},
-            "Комментарий гостя": {"rich_text": [{"text": {"content": comment}}]},
-            "Дата отзыва": {"date": {"start": visit_date}},
-            "Статус": {"select": {"name": "Новая"}}
-        }
-    }
-    res = requests.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=page_data)
-    return res.status_code == 200
-
-async def check_reviews():
-    global bot_app
-    if not bot_app:
-        return
-
-    # Каждый раз читаем из Notion что уже обработано
-    processed = get_processed_from_notion()
-    rows = get_csi_rows()
-
-    for cols in rows:
-        comment = cols[7].strip() if len(cols) > 7 else ""
-        if not comment:
-            continue
-
-        worst_score, worst_cat = find_worst_score(cols)
-        if worst_score >= 7:
-            continue
-
-        # Формируем уникальный ключ
-        visit_date_raw = cols[0].split(" ")[0] if cols[0] else ""
-        try:
-            parts = visit_date_raw.split(".")
-            visit_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}" if len(parts) == 3 else date.today().isoformat()
-        except:
-            visit_date = date.today().isoformat()
-
-        key = f"{visit_date}_{comment}"
-        if key in processed:
-            continue
-
-        # Создаём задачу в Notion
-        created = create_notion_problem(cols, worst_score, worst_cat, comment, visit_date)
-
-        scores_text = (
-            f"😊 Вечер: {cols[1]}/10\n"
-            f"🪄 Кальян: {cols[2]}/10\n"
-            f"🍹 Напитки: {cols[3]}/10\n"
-            f"🍽 Еда: {cols[4]}/10\n"
-            f"👨‍💼 Команда: {cols[5]}/10\n"
-            f"🎯 NPS: {cols[6]}/10"
-        )
-        text = (
-            f"🚨 *Негативный отзыв гостя!*\n\n"
-            f"{scores_text}\n"
-            f"👎 Проблема: *{worst_cat}* ({worst_score}/10)\n"
-            f"💬 _{comment}_\n"
-        )
-        text += "\n✅ Задача создана в Notion!" if created else "\n⚠️ Не удалось создать задачу."
-
-        await bot_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
-
-# ─── eNPS ────────────────────────────────────────────
-
-def get_enps_data():
-    url = f"https://docs.google.com/spreadsheets/d/{ENPS_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=enps"
     res = requests.get(url)
     if res.status_code != 200:
         return None
     lines = res.text.strip().split("\n")
     if len(lines) < 2:
         return None
-
     rows = []
     for line in lines[1:]:
-        cols = [c.strip().strip('"') for c in line.split(",")]
-        if len(cols) >= 2 and cols[1]:
+        cols = line.replace('"', '').split(",")
+        if len(cols) >= 7:
             rows.append(cols)
     if not rows:
         return None
-
-    this_month = date.today().strftime("%m")
-    month_rows = [r for r in rows if r[0].startswith(this_month + ".")]
+    this_month = date.today().strftime("%m.%Y")
+    month_rows = [r for r in rows if r[0].endswith(this_month[:2] + "." + this_month[3:])]
     use_rows = month_rows if month_rows else rows
     total = len(use_rows)
+    if total == 0:
+        return None
+
+    def avg(col_idx):
+        vals = []
+        for r in use_rows:
+            try:
+                vals.append(float(r[col_idx].strip().replace(",", ".")))
+            except:
+                pass
+        return round(sum(vals) / len(vals), 1) if vals else 0
 
     promoters = neutrals = critics = 0
-    likes, improvements = [], []
     for r in use_rows:
         try:
-            score = float(r[1].replace(",", "."))
+            score = float(r[6].strip().replace(",", "."))
             if score >= 9: promoters += 1
             elif score >= 7: neutrals += 1
             else: critics += 1
         except:
             pass
-        if len(r) > 2 and r[2].strip():
-            likes.append(r[2].strip())
-        if len(r) > 3 and r[3].strip():
-            improvements.append(r[3].strip())
+    nps = round(((promoters - critics) / total) * 100) if total > 0 else 0
 
-    enps = round(((promoters - critics) / total) * 100) if total > 0 else 0
-
-    prev_month_num = date.today().month - 1
-    prev_year = date.today().year
-    if prev_month_num == 0:
-        prev_month_num = 12
-        prev_year -= 1
-    prev_month = f"{prev_month_num:02d}"
-    prev_rows = [r for r in rows if r[0].startswith(prev_month + ".")]
-    prev_enps = None
-    if prev_rows:
-        pt = len(prev_rows)
-        pp = pc = 0
-        for r in prev_rows:
-            try:
-                s = float(r[1].replace(",", "."))
-                if s >= 9: pp += 1
-                elif s < 7: pc += 1
-            except: pass
-        prev_enps = round(((pp - pc) / pt) * 100) if pt > 0 else 0
+    comments = []
+    for r in use_rows:
+        if len(r) > 7 and r[7].strip():
+            comments.append(r[7].strip())
 
     return {
-        "total": total, "promoters": promoters, "neutrals": neutrals,
-        "critics": critics, "enps": enps, "prev_enps": prev_enps,
-        "likes": likes[-5:], "improvements": improvements[-5:],
-        "period": "этот месяц" if month_rows else "всё время"
+        "total": total, "mood": avg(1), "hookah": avg(2), "drinks": avg(3), "food": avg(4), "team": avg(5),
+        "nps": nps, "promoters": promoters, "neutrals": neutrals, "critics": critics,
+        "comments": comments[-3:], "period": "этот месяц" if month_rows else "всё время"
     }
 
-# ─── КОМАНДЫ ─────────────────────────────────────────
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("🛑 Остановлено. Напиши имя гостя чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👨‍💼 *Бот администратора*\n\n"
-        "🔔 Уведомляю о негативных отзывах с замечаниями каждый час.\n"
-        "🎂 Каждое утро в 9:00 присылаю именинников.\n\n"
-        "/enps — eNPS сотрудников\n"
-        "/problems — открытые проблемы\n"
-        "/birthdays — именинники сегодня",
-        parse_mode="Markdown"
+async def get_guest_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    res = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+        headers=HEADERS,
+        json={"filter": {"property": "Имя Гостя", "title": {"contains": name}}}
     )
+    results = res.json().get("results", [])
 
-async def enps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Загружаю данные...")
-    data = get_enps_data()
-    if not data:
-        await update.message.reply_text("❌ Нет данных.")
-        return
-
-    if data["prev_enps"] is not None:
-        diff = data["enps"] - data["prev_enps"]
-        trend = f"📈 +{diff}" if diff > 0 else (f"📉 {diff}" if diff < 0 else "➡️ Без изменений")
+    if len(results) == 1:
+        return await show_guest(update, context, results[0])
+    elif len(results) > 1:
+        context.user_data["search_results"] = [
+            {"id": g["id"], "name": g["properties"]["Имя Гостя"]["title"][0]["plain_text"]}
+            for g in results
+        ]
+        names = [g["name"] for g in context.user_data["search_results"]]
+        keyboard = [[n] for n in names] + [["❌ Никто из них"]]
+        await update.message.reply_text(
+            f"Нашёл {len(results)} гостей с именем «{name}».\nВыбери нужного:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+        return SELECT_GUEST
     else:
-        trend = "📊 Нет данных за прошлый месяц"
+        await update.message.reply_text(f"❌ Гость «{name}» не найден. Проверьте имя.")
+        return GUEST_NAME
 
-    rating = "🟢 Отлично" if data["enps"] >= 50 else ("🟡 Хорошо" if data["enps"] >= 20 else ("🟠 Удовлетворительно" if data["enps"] >= 0 else "🔴 Критично"))
+async def select_guest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "❌ Никто из них":
+        await update.message.reply_text("Напиши имя гостя:", reply_markup=ReplyKeyboardRemove())
+        return GUEST_NAME
+    for g in context.user_data.get("search_results", []):
+        if g["name"] == text:
+            res = requests.get(f"https://api.notion.com/v1/pages/{g['id']}", headers=HEADERS)
+            return await show_guest(update, context, res.json())
+    await update.message.reply_text("Не понял выбор. Попробуй ещё раз.")
+    return SELECT_GUEST
+
+async def show_guest(update, context, guest):
+    props = guest["properties"]
+    guest_page_id = guest["id"]
+    context.user_data["current_guest_id"] = guest_page_id
+
+    def get_text(prop):
+        items = props.get(prop, {}).get("rich_text", [])
+        return items[0]["plain_text"] if items else "не указано"
+    def get_title(prop):
+        items = props.get(prop, {}).get("title", [])
+        return items[0]["plain_text"] if items else "не указано"
+    def get_select(prop):
+        s = props.get(prop, {}).get("select")
+        return s["name"] if s else "не указано"
+    def get_date(prop):
+        d = props.get(prop, {}).get("date")
+        return d["start"] if d else "не указана"
+    def get_phone(prop):
+        return props.get(prop, {}).get("phone_number") or "не указан"
+
+    birthday_raw = get_date("Дата рождения")
+    birthday = birthday_raw
+    if birthday_raw != "не указана":
+        try:
+            parts = birthday_raw.split("-")
+            if len(parts) == 3:
+                birthday = f"{parts[2]}.{parts[1]}.{parts[0]}"
+        except:
+            pass
+    birthday_alert = ""
+    if birthday_raw != "не указана":
+        try:
+            bd_month_day = birthday_raw[5:]
+            today_month_day = date.today().strftime("%m-%d")
+            if bd_month_day == today_month_day:
+                birthday_alert = "\n\n🎂🎉 *СЕГОДНЯ ДЕНЬ РОЖДЕНИЯ ГОСТЯ!* 🎉🎂"
+        except:
+            pass
 
     text = (
-        f"👨‍💼 *eNPS Сотрудников*\n"
-        f"_{data['period']} · {data['total']} ответов_\n\n"
-        f"🎯 *eNPS: {data['enps']}* — {rating}\n"
-        f"{trend}\n\n"
-        f"👍 Промоутеры (9-10): *{data['promoters']}*\n"
-        f"😐 Нейтралы (7-8): *{data['neutrals']}*\n"
-        f"👎 Критики (0-6): *{data['critics']}*\n"
+        f"👤 *{get_title('Имя Гостя')}*\n"
+        f"🏷 Статус: {get_select('Частота визитов')}\n"
+        f"🎂 День рождения: {birthday}\n"
+        f"📱 Телефон: {get_phone('Телефон')}\n"
+        f"⭐ Важно: {get_text('Что важно для гостя')}\n"
     )
-    if data["likes"]:
-        text += "\n✅ *Что нравится:*\n" + "".join(f"  • {l}\n" for l in data["likes"])
-    if data["improvements"]:
-        text += "\n⚠️ *Что улучшить:*\n" + "".join(f"  • {i}\n" for i in data["improvements"])
 
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def problems(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    res = requests.post(
-        f"https://api.notion.com/v1/databases/{NOTION_PROBLEMS_DB_ID}/query",
-        headers=NOTION_HEADERS,
+    visits_res = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_VISITS_DB_ID}/query",
+        headers=HEADERS,
         json={
-            "filter": {
-                "or": [
-                    {"property": "Статус", "select": {"equals": "Новая"}},
-                    {"property": "Статус", "select": {"equals": "В работе"}}
-                ]
-            },
-            "sorts": [{"property": "Дата отзыва", "direction": "descending"}]
+            "filter": {"property": "Гость", "relation": {"contains": guest_page_id}},
+            "sorts": [{"property": "Дата", "direction": "descending"}],
+            "page_size": 3
         }
     )
-    results = res.json().get("results", [])
+    visits = visits_res.json().get("results", [])
 
-    if not results:
-        await update.message.reply_text("✅ Открытых проблем нет!")
-        return
+    if visits:
+        text += "\n📋 *Последние визиты:*\n"
+        for v in visits:
+            vp = v["properties"]
+            def vget_text(p):
+                items = vp.get(p, {}).get("rich_text", [])
+                return items[0]["plain_text"] if items else "—"
+            def vget_date(p):
+                d = vp.get(p, {}).get("date")
+                return d["start"] if d else "—"
+            text += (
+                f"🗓 {vget_date('Дата')}\n"
+                f"   🪄 {vget_text('Кальян')}  🍹 {vget_text('Напитки')}\n"
+                f"   📝 {vget_text('Заметки')}\n"
+            )
+    else:
+        text += "\n📋 Визитов пока нет."
 
-    text = f"⚠️ *Открытые проблемы ({len(results)}):*\n\n"
-    for p in results:
-        props = p["properties"]
-        category = props["Категория"]["select"]["name"] if props["Категория"]["select"] else "—"
-        score = props["Оценка гостя"]["number"] if props["Оценка гостя"]["number"] else "—"
-        status = props["Статус"]["select"]["name"] if props["Статус"]["select"] else "—"
-        deadline = props["Срок исполнения"]["date"]["start"] if props["Срок исполнения"]["date"] else "не указан"
-        responsible = props["Ответственный"]["rich_text"][0]["plain_text"] if props["Ответственный"]["rich_text"] else "не назначен"
-        status_icon = "🔴" if status == "Новая" else "🟡"
-        text += f"{status_icon} *{category}* — {score}/10\n   👤 {responsible} · 📅 {deadline}\n\n"
+    text += birthday_alert
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    keyboard = [["✏️ Редактировать карточку"], ["🔍 Новый поиск"]]
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return AFTER_CARD
 
-# ─── ДНИ РОЖДЕНИЯ ────────────────────────────────────
+# ─── ПОСЛЕ ПОКАЗА КАРТОЧКИ ────────────────────────────
 
-def get_todays_birthdays():
-    """Находит гостей у которых сегодня день рождения"""
-    res = requests.post(
-        f"https://api.notion.com/v1/databases/{NOTION_GUESTS_DB_ID}/query",
-        headers=NOTION_HEADERS,
-        json={"page_size": 100}
+async def after_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "✏️ Редактировать карточку":
+        keyboard = [
+            ["🏷 Статус", "🎂 День рождения"],
+            ["📱 Телефон", "⭐ Что важно"],
+            ["❌ Отмена"]
+        ]
+        await update.message.reply_text("Что редактируем?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return EDIT_CHOICE
+    elif text == "🔍 Новый поиск":
+        await update.message.reply_text("Напиши имя гостя:", reply_markup=ReplyKeyboardRemove())
+        return GUEST_NAME
+    else:
+        # Считаем что это новое имя для поиска
+        return await get_guest_name(update, context)
+
+# ─── РЕДАКТИРОВАНИЕ ───────────────────────────────────
+
+async def edit_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено. Напиши имя гостя для нового поиска.", reply_markup=ReplyKeyboardRemove())
+        return GUEST_NAME
+
+    field_map = {
+        "🏷 Статус": "status",
+        "🎂 День рождения": "birthday",
+        "📱 Телефон": "phone",
+        "⭐ Что важно": "important"
+    }
+
+    if text not in field_map:
+        await update.message.reply_text("Не понял выбор.")
+        return EDIT_CHOICE
+
+    context.user_data["edit_field"] = field_map[text]
+
+    if field_map[text] == "status":
+        keyboard = [["VIP", "Постоянный"], ["Редкий", "Новый"]]
+        await update.message.reply_text("Новый статус?", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    elif field_map[text] == "birthday":
+        await update.message.reply_text("Новая дата рождения?\n(Например: 15.06.1990)", reply_markup=ReplyKeyboardRemove())
+    elif field_map[text] == "phone":
+        await update.message.reply_text("Новый номер телефона?", reply_markup=ReplyKeyboardRemove())
+    elif field_map[text] == "important":
+        await update.message.reply_text("Что важно для гостя?", reply_markup=ReplyKeyboardRemove())
+
+    return EDIT_VALUE
+
+async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    field = context.user_data["edit_field"]
+    guest_id = context.user_data["current_guest_id"]
+
+    properties = {}
+
+    if field == "status":
+        properties["Частота визитов"] = {"select": {"name": text}}
+    elif field == "birthday":
+        try:
+            parts = text.split(".")
+            if len(parts) == 3:
+                iso_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+                properties["Дата рождения"] = {"date": {"start": iso_date}}
+            else:
+                await update.message.reply_text("❌ Неверный формат. Используй: 15.06.1990")
+                return EDIT_VALUE
+        except:
+            await update.message.reply_text("❌ Неверный формат. Используй: 15.06.1990")
+            return EDIT_VALUE
+    elif field == "phone":
+        properties["Телефон"] = {"phone_number": text}
+    elif field == "important":
+        properties["Что важно для гостя"] = {"rich_text": [{"text": {"content": text}}]}
+
+    res = requests.patch(f"https://api.notion.com/v1/pages/{guest_id}", headers=HEADERS, json={"properties": properties})
+
+    if res.status_code == 200:
+        await update.message.reply_text("✅ Обновлено! Напиши имя гостя для нового поиска.", reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text("❌ Ошибка при обновлении.", reply_markup=ReplyKeyboardRemove())
+
+    context.user_data.clear()
+    return GUEST_NAME
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Собираю статистику...")
+
+    all_visits = query_all(NOTION_VISITS_DB_ID)
+    all_guests = query_all(NOTION_DB_ID)
+
+    this_month = date.today().strftime("%Y-%m")
+    month_visits = []
+    guest_visit_count = Counter()
+    hookah_counter = Counter()
+    drinks_counter = Counter()
+
+    for v in all_visits:
+        vp = v["properties"]
+        d = vp.get("Дата", {}).get("date")
+        visit_date = d["start"] if d else ""
+        if visit_date.startswith(this_month):
+            month_visits.append(v)
+        relations = vp.get("Гость", {}).get("relation", [])
+        if relations:
+            guest_visit_count[relations[0]["id"]] += 1
+        hookah_items = vp.get("Кальян", {}).get("rich_text", [])
+        if hookah_items:
+            h = hookah_items[0]["plain_text"].strip()
+            if h and h != "—":
+                hookah_counter[h] += 1
+        drinks_items = vp.get("Напитки", {}).get("rich_text", [])
+        if drinks_items:
+            dr = drinks_items[0]["plain_text"].strip()
+            if dr and dr != "—":
+                drinks_counter[dr] += 1
+
+    guest_names = {}
+    for g in all_guests:
+        title = g["properties"].get("Имя Гостя", {}).get("title", [])
+        if title:
+            guest_names[g["id"]] = title[0]["plain_text"]
+
+    new_guests_month = sum(1 for g in all_guests if g.get("created_time", "").startswith(this_month))
+
+    top_guests_text = ""
+    for i, (gid, count) in enumerate(guest_visit_count.most_common(5), 1):
+        top_guests_text += f"  {i}. {guest_names.get(gid, '?')} — {count} визитов\n"
+
+    top_hookah_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(hookah_counter.most_common(3), 1))
+    top_drinks_text = "".join(f"  {i}. {n} — {c}x\n" for i, (n, c) in enumerate(drinks_counter.most_common(3), 1))
+
+    text = (
+        f"📊 *Статистика заведения*\n"
+        f"_{date.today().strftime('%B %Y')}_\n\n"
+        f"📅 Визитов в этом месяце: *{len(month_visits)}*\n"
+        f"🆕 Новых гостей: *{new_guests_month}*\n"
+        f"👥 Всего гостей в базе: *{len(all_guests)}*\n\n"
+        f"🏆 *Топ гостей по визитам:*\n{top_guests_text or '  Нет данных'}\n"
+        f"🪄 *Популярный кальян:*\n{top_hookah_text or '  Нет данных'}\n"
+        f"🍹 *Популярные напитки:*\n{top_drinks_text or '  Нет данных'}"
     )
-    results = res.json().get("results", [])
-    today_md = date.today().strftime("%m-%d")
 
-    birthdays = []
-    for g in results:
-        props = g["properties"]
-        bday = props.get("Дата рождения", {}).get("date")
-        if bday and bday.get("start"):
-            bday_md = bday["start"][5:10]  # MM-DD
-            if bday_md == today_md:
-                name_title = props.get("Имя Гостя", {}).get("title", [])
-                name = name_title[0]["plain_text"] if name_title else "Без имени"
-                phone = props.get("Телефон", {}).get("phone_number") or "не указан"
-                birthdays.append({"name": name, "phone": phone})
-    return birthdays
+    csi = get_csi_nps_data()
+    if csi:
+        def bar(score):
+            filled = int(score / 2)
+            return "🟩" * filled + "⬜" * (5 - filled)
 
-async def check_birthdays():
-    global bot_app
-    if not bot_app:
-        return
-    birthdays = get_todays_birthdays()
-    if birthdays:
-        text = "🎂 *Сегодня день рождения у гостей:*\n\n"
-        for b in birthdays:
-            text += f"👤 {b['name']} — 📱 {b['phone']}\n"
-        text += "\n💝 Не забудьте поздравить и предложить именинную скидку!"
-        await bot_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown")
+        text += f"\n\n━━━━━━━━━━━━━━\n"
+        text += f"⭐ *CSI / NPS — {csi['period']}* ({csi['total']} отзывов)\n\n"
+        text += f"😊 Вечер в целом: *{csi['mood']}/10* {bar(csi['mood'])}\n"
+        text += f"🪄 Кальян: *{csi['hookah']}/10* {bar(csi['hookah'])}\n"
+        text += f"🍹 Напитки: *{csi['drinks']}/10* {bar(csi['drinks'])}\n"
+        text += f"🍽 Еда: *{csi['food']}/10* {bar(csi['food'])}\n"
+        text += f"👨‍💼 Команда: *{csi['team']}/10* {bar(csi['team'])}\n\n"
+        text += f"🎯 *NPS: {csi['nps']}*\n"
+        text += f"  👍 Промоутеры: {csi['promoters']}\n"
+        text += f"  😐 Нейтралы: {csi['neutrals']}\n"
+        text += f"  👎 Критики: {csi['critics']}\n"
+        if csi['comments']:
+            text += f"\n💬 *Последние отзывы:*\n"
+            for c in csi['comments']:
+                text += f"  • {c}\n"
+    else:
+        text += "\n\n⭐ *CSI/NPS:* нет данных"
 
-async def birthdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    birthdays = get_todays_birthdays()
-    if not birthdays:
-        await update.message.reply_text("🎂 Сегодня именинников нет.")
-        return
-    text = "🎂 *Сегодня день рождения у гостей:*\n\n"
-    for b in birthdays:
-        text += f"👤 {b['name']} — 📱 {b['phone']}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+conv_handler = ConversationHandler(
+    entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, get_guest_name)],
+    states={
+        GUEST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_guest_name)],
+        SELECT_GUEST: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_guest)],
+        AFTER_CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, after_card)],
+        EDIT_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_choice)],
+        EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
+    },
+    fallbacks=[
+        CommandHandler("stop", stop),
+        CommandHandler("cancel", stop),
+    ],
+)
 
-
-async def post_init(application):
-    global bot_app
-    bot_app = application
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_reviews, "interval", hours=1, id="check_reviews")
-    scheduler.add_job(check_birthdays, "cron", hour=9, minute=0, id="check_birthdays")
-    scheduler.start()
-    await check_reviews()
-
-app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("enps", enps))
-app.add_handler(CommandHandler("problems", problems))
-app.add_handler(CommandHandler("birthdays", birthdays_cmd))
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+app.add_handler(CommandHandler("stats", stats))
+app.add_handler(conv_handler)
 app.run_polling()
